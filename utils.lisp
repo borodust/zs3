@@ -54,13 +54,28 @@
               minute
               second))))
 
-(defun iso8601-date-string (&optional (time (get-universal-time)))
+(defun signature-date-string (&optional (time (get-universal-time)))
+  ""
+  (multiple-value-bind (second minute hour day month year day-of-week)
+      (decode-universal-time time 0)
+    (declare (ignore second minute hour day-of-week))
+    (let ((*print-pretty* nil))
+      (format nil "~A~2,'0D~2,'0D"
+              year
+	      month
+	      day))))
+
+
+(defun iso8601-date-string (&optional (time (get-universal-time)) (delimiters-p t))
   "Return a HTTP-style date string."
   (multiple-value-bind (second minute hour day month year)
       (decode-universal-time time 0)
     (let ((*print-pretty* nil))
-      (format nil "~4,'0D-~2,'0D-~2,'0DT~2,'0D:~2,'0D:~2,'0DZ"
-              year month day hour minute second))))
+      (if delimiters-p
+	  (format nil "~4,'0D-~2,'0D-~2,'0DT~2,'0D:~2,'0D:~2,'0DZ"
+		  year month day hour minute second)
+	  (format nil "~4,'0D~2,'0D~2,'0DT~2,'0D~2,'0D~2,'0DZ"
+		  year month day hour minute second)))))
 
 (defun string-octets (string)
   "Return the UTF-8 encoding of STRING as a vector of octets."

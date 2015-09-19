@@ -29,10 +29,11 @@
 
 (in-package #:zs3)
 
+
 (defclass digester ()
-  ((hmac
-    :initarg :hmac
-    :accessor hmac)
+  ((digester
+    :initarg :digester
+    :accessor digester)
    (newline
     :initarg :newline
     :accessor newline
@@ -45,30 +46,64 @@
    :newline (make-array 1 :element-type '(unsigned-byte 8)
                         :initial-element 10)))
 
-(defun make-digester (key)
-  (let ((hmac (ironclad:make-hmac (string-octets key) :sha1)))
-    (make-instance 'digester
-                   :hmac hmac)))
-
-(defgeneric add-string (string digester)
-  (:method (string digester)
-    (write-string string (signed-stream digester))
-    (ironclad:update-hmac (hmac digester) (string-octets string))))
-
-(defgeneric add-newline (digester)
-  (:method (digester)
-    (terpri (signed-stream digester))
-    (ironclad:update-hmac (hmac digester) (newline digester))))
+(defgeneric add-string (string digester))
+(defgeneric add-newline (digester))
 
 (defgeneric add-line (string digester)
   (:method (string digester)
     (add-string string digester)
     (add-newline digester)))
 
-(defgeneric digest64 (digester)
-  (:method (digester)
-    (base64:usb8-array-to-base64-string
-     (ironclad:hmac-digest (hmac digester)))))
+(defgeneric digest64 (digester))
+(defgeneric digest-hex (digester))
+
+
+(defclass hmac-digester (digester) ())
+
+(defun make-hmac-digester (key)
+  (make-instance 'hmac-digester
+		 :digester (make-hmac (string-octets key))))
+
+(defmethod add-string (string (digester hmac-digester))
+  (write-string string (signed-stream digester))
+  (ironclad:update-hmac (digester digester) (string-octets string)))
+
+(defmethod add-newline ((digester hmac-digester))
+  (terpri (signed-stream digester))
+  (ironclad:update-hmac (digester digester) (newline digester)))
+
+(defmethod digest64 ((digester hmac-digester))
+  (base64:usb8-array-to-base64-string
+   (ironclad:hmac-digest (digester digester))))
+
+(defmethod digest-hex ((digester hmac-digester))
+  (ironclad:byte-array-to-hex-string
+   (ironclad:hmac-digest (digester digester))))
+
+
+(defclass sha256-digester (digester)())
+
+(defun make-sha256-digester ()
+  (make-instance 'sha256-digester
+		 :digester (ironclad:make-digest :sha256)))
+
+(defmethod add-string (string (digester sha256-digester))
+  (write-string string (signed-stream digester))
+  (ironclad:update-digest (digester digester) (string-octets string)))
+
+(defmethod add-newline ((digester sha256-digester))
+  (terpri (signed-stream digester))
+  (ironclad:update-digest (digester digester) (newline digester)))
+
+(defmethod digest64 ((digester sha256-digester))
+  (base64:usb8-array-to-base64-string
+   (ironclad:produce-digest (digester digester))))
+
+(defmethod digest-hex ((digester sha256-digester))
+  (ironclad:byte-array-to-hex-string
+   (ironclad:produce-digest (digester digester))))
+
+
 
 (defun file-md5 (file)
    (ironclad:digest-file :md5 file))
@@ -79,6 +114,20 @@
 (defun file-md5/hex (file)
   (ironclad:byte-array-to-hex-string (file-md5 file)))
 
+(defun file-sha256 (file)
+   (ironclad:digest-file :sha256 file))
+
+(defun file-sha256/hex (file)
+  (ironclad:byte-array-to-hex-string
+   (file-sha256 file)))
+
+(defun vector-sha256/hex (octets)
+  (ironclad:byte-array-to-hex-string
+   (ironclad:digest-sequence :sha256 octets)))
+
+(defun string-sha256/hex (text)
+  (vector-sha256/hex (string-octets text)))
+
 (defun vector-md5/b64 (vector)
   (base64:usb8-array-to-base64-string
    (ironclad:digest-sequence :md5 vector)))
@@ -87,6 +136,15 @@
   (format nil "\"~A\"" (file-md5/hex file)))
 
 (defun sign-string (key string)
-  (let ((digester (make-digester key)))
+  (let ((digester (make-hmac-digester key)))
     (add-string string digester)
     (digest64 digester)))
+
+(defun make-hmac (&optional key)
+  (ironclad:make-hmac (or key (make-array 0 :element-type '(unsigned-byte 8))) :sha1))
+
+(defun hmac-digest (hmac key-octets text)
+  (reinitialize-instance hmac :key key-octets)
+  (ironclad:update-hmac hmac (string-octets text))
+  (ironclad:hmac-digest hmac))
+

@@ -30,6 +30,8 @@
 (in-package #:zs3)
 
 (defvar *s3-endpoint* "s3.amazonaws.com")
+(defvar *s3-region* nil)
+(defvar *signature-version* 2)
 (defvar *use-ssl* nil)
 (defvar *use-content-md5* t)
 
@@ -42,6 +44,9 @@
    (endpoint
     :initarg :endpoint
     :accessor endpoint)
+   (region 
+    :initarg :region
+    :accessor region)
    (ssl
     :initarg :ssl
     :accessor ssl)
@@ -117,6 +122,7 @@
    :credentials *credentials*
    :method :get
    :endpoint *s3-endpoint*
+   :region *s3-region*
    :ssl *use-ssl*
    :bucket nil
    :key nil
@@ -127,7 +133,7 @@
    :content nil
    :metadata nil
    :amz-headers nil
-   :signature-version 2
+   :signature-version *signature-version*
    :extra-http-headers nil))
 
 (defmethod slot-unbound ((class t) (request request) (slot (eql 'date)))
@@ -173,6 +179,11 @@
         (write-string "?" stream)
         (write-string (puri:uri-query parsed) stream)))))
 
+(defgeneric host (request)
+  (:method (request)
+    (let ((uri (puri:parse-uri (url request))))
+      (puri:uri-host uri))))
+
 (defgeneric signed-path (request)
   (:method (request)
     (let ((*print-pretty* nil))
@@ -205,13 +216,18 @@
 
 (defgeneric all-amazon-headers (request)
   (:method (request)
-    (nconc
-     (loop for ((key . value)) on (amz-headers request)
-           collect (cons (format nil "x-amz-~(~A~)" key)
-                         value))
-     (loop for ((key . value)) on (metadata request)
-           collect (cons (format nil "x-amz-meta-~(~A~)" key)
-                         value)))))
+    (let (custom-headers)
+      (when (eql (signature-version request) 4)
+	(push (cons "x-amz-content-sha256" (content-sha256-hex request)) custom-headers)
+	(push (cons "x-amz-date" (iso8601-date-string (date request) nil)) custom-headers))
+      (nconc 
+       (loop for ((key . value)) on (amz-headers request)
+	  collect (cons (format nil "x-amz-~(~A~)" key)
+			value))
+       (loop for ((key . value)) on (metadata request)
+	  collect (cons (format nil "x-amz-meta-~(~A~)" key)
+			value))
+       custom-headers))))
 
 (defgeneric amazon-header-signing-lines (request)
   (:method (request)
@@ -220,6 +236,11 @@
            (sorted (sort headers #'string< :key #'car)))
       (loop for ((key . value)) on sorted
             collect (format nil "~A:~A" key value)))))
+
+(defun maybe-add-line (string digester)
+  (if string
+      (add-line string digester)
+      (add-newline digester)))
 
 (defgeneric date-string (request)
   (:method (request)
@@ -230,21 +251,95 @@
    
 (defgeneric signature (request version)
   (:method (request (version (eql 2)))
-    (let ((digester (make-digester (secret-key request))))
-      (flet ((maybe-add-line (string digester)
-               (if string
-                   (add-line string digester)
-                   (add-newline digester))))
-        (add-line (http-method request) digester)
-        (maybe-add-line (content-md5 request) digester)
-        (maybe-add-line (content-type request) digester)
-        (add-line (date-string request) digester)
-        (dolist (line (amazon-header-signing-lines request))
-          (add-line line digester))
-        (add-string (signed-path request) digester)
-        (setf (signed-string request)
-              (get-output-stream-string (signed-stream digester)))
-        (format-v2-authorization request (digest64 digester))))))
+    (let ((digester (make-hmac-digester (secret-key request))))
+      (add-line (http-method request) digester)
+      (maybe-add-line (content-md5 request) digester)
+      (maybe-add-line (content-type request) digester)
+      (add-line (date-string request) digester)
+      (dolist (line (amazon-header-signing-lines request))
+	(add-line line digester))
+      (add-string (signed-path request) digester)
+      (setf (signed-string request)
+	    (get-output-stream-string (signed-stream digester)))
+      (format-v2-authorization request (digest64 digester)))))
+
+(defgeneric all-headers-for-sign (request)
+  (:method (request)
+    (let ((headers (list (cons "host" (host request)))))
+      (when (content-type request)
+	(push (cons "content-type" (content-type request)) headers))
+      (sort (nconc
+	     (all-amazon-headers request)
+	     headers)
+	    #'string< :key #'car))))
+
+(defun header-names-for-sign (request)
+    (let* ((headers (all-headers-for-sign request))
+	   (header-names (loop for (name . value) in headers
+			    collecting name)))
+      (format nil "~{~a~^;~}" header-names)))
+
+(defgeneric all-header-signing-lines (request)
+  (:method (request)
+    ;; FIXME: handle values with commas, and repeated headers
+    (let* ((headers (all-headers-for-sign request)))
+      (loop for ((key . value)) on headers
+            collect (format nil "~A:~A" key value)))))
+
+(defun format-v4-authorization (request signature)
+  (format nil
+	  "AWS4-HMAC-SHA256 Credential=~a/~a, SignedHeaders=~a, Signature=~a"
+	  (access-key request)
+	  (signature-scope request)
+	  (header-names-for-sign request)
+	  signature))
+
+(defun content-sha256-hex (request)
+  (if (content request)
+      (vector-sha256/hex (content request))
+      (string-sha256/hex "")))
+  
+(defun canonical-request-digest (request)
+  (let ((digester (make-sha256-digester)))
+    (add-line (http-method request) digester)
+    (add-line (request-path request) digester)
+    (add-newline digester)
+    (dolist (line (all-header-signing-lines request))
+      (add-line line digester))
+    (add-newline digester)
+    (maybe-add-line (header-names-for-sign request) digester)
+    (add-string (content-sha256-hex request) digester)
+    (format t "~&CREQ-START~%\"~a\"~%CREQ-END~&" (get-output-stream-string (signed-stream digester)))
+    (digest-hex digester)))
+
+(defun signature-scope (request)
+  (format nil "~a/~a/s3/aws4_request"
+	  (signature-date-string (date request))
+	  (region request)))
+
+(defun string-to-sign (request request-digest)
+  (format nil "AWS4-HMAC-SHA256~%~a~%~a~%~a"
+	  (iso8601-date-string (date request) nil)
+	  (signature-scope request)
+	  request-digest))
+
+(defun make-digester-key (request)
+  (let* ((hmac (make-hmac))
+	 (secret-key-v4 (string-octets (format nil "AWS4~a" (secret-key request))))
+	 (date-key (hmac-digest hmac secret-key-v4
+				(signature-date-string (date request))))
+	 (date-region-key (hmac-digest hmac date-key (region request)))
+	 (date-region-service-key (hmac-digest hmac date-region-key "s3")))
+    (hmac-digest hmac date-region-service-key "aws4_request")))
+
+(defmethod signature (request (version (eql 4)))
+  (let* ((request-digest (canonical-request-digest request))
+	 (string-to-sign (string-to-sign request request-digest))
+	 (key (make-digester-key request))
+	 (digester (make-hmac-digester key)))
+    (format t "~&STS-START~%\"~a\"~%STS-END~&" string-to-sign)
+    (add-string string-to-sign digester)
+    (format-v4-authorization request (digest-hex digester))))
 
 (defgeneric drakma-headers (request)
   (:method (request)
@@ -291,6 +386,7 @@
                                 :content-length (content-length request)
                                 :parameters (parameters request)
                                 :content :continuation)))
+;      (break)
       (let ((content (content request)))
         (if (pathnamep content)
             (send-file-content continuation request)
@@ -301,4 +397,3 @@
 
 (defmethod secret-key ((request request))
   (secret-key (credentials request)))
-
