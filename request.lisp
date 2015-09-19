@@ -105,6 +105,9 @@
    (signed-string
     :initarg :signed-string
     :accessor signed-string)
+   (signature-version 
+    :initarg :signature-version
+    :accessor signature-version)
    (extra-http-headers
     :initarg :extra-http-headers
     :accessor extra-http-headers
@@ -124,6 +127,7 @@
    :content nil
    :metadata nil
    :amz-headers nil
+   :signature-version 2
    :extra-http-headers nil))
 
 (defmethod slot-unbound ((class t) (request request) (slot (eql 'date)))
@@ -221,8 +225,11 @@
   (:method (request)
     (http-date-string (date request))))
 
-(defgeneric signature (request)
-  (:method (request)
+(defun format-v2-authorization (request signature)
+  (format nil "AWS ~A:~A" (access-key request) signature))
+   
+(defgeneric signature (request version)
+  (:method (request (version (eql 2)))
     (let ((digester (make-digester (secret-key request))))
       (flet ((maybe-add-line (string digester)
                (if string
@@ -237,16 +244,13 @@
         (add-string (signed-path request) digester)
         (setf (signed-string request)
               (get-output-stream-string (signed-stream digester)))
-        (digest64 digester)))))
-        
+        (format-v2-authorization request (digest64 digester))))))
+
 (defgeneric drakma-headers (request)
   (:method (request)
     (let ((base
            (list* (cons "Date" (http-date-string (date request)))
-                  (cons "Authorization"
-                        (format nil "AWS ~A:~A"
-                                (access-key request)
-                                (signature request)))
+                  (cons "Authorization" (signature request (signature-version request)))
                   (all-amazon-headers request))))
       (when (content-md5 request)
         (push (cons "Content-MD5" (content-md5 request)) base))
